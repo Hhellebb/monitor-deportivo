@@ -43,3 +43,12 @@ Pronosticos/
 Configurar en **Settings → Secrets and variables → Actions**:
 * `SUPABASE_URL`
 * `SUPABASE_SERVICE_ROLE_KEY`
+
+## Despliegue de la PWA en Vercel (Fase 4)
+
+1. Importar el repositorio privado en Vercel y establecer **Root Directory** = `web`.
+2. Configurar las variables de entorno públicas (solo lectura RLS):
+   * `NEXT_PUBLIC_SUPABASE_URL`
+   * `NEXT_PUBLIC_SUPABASE_ANON_KEY`
+3. Ejecutar **Deploy**. Para instalar en el celular: abrir la URL en Safari (iOS) o Chrome (Android) → **Agregar a la pantalla de inicio**.
+
