@@ -2,9 +2,10 @@
 
 import { useMemo, useState } from "react";
 import { Clock } from "lucide-react";
-import type { PredictionWithMatch } from "@/lib/supabase";
+import type { ParlayWithLegs, PredictionWithMatch } from "@/lib/supabase";
 import { getLocalDateKey } from "@/lib/formatters";
 import { LocalTime } from "@/components/LocalTime";
+import { ParlayCard } from "@/components/ParlayCard";
 
 type TimeRangeKey = "yesterday" | "7days" | "month";
 
@@ -40,9 +41,10 @@ const BADGE_MAP: Record<
 
 interface ResultsViewProps {
   results: PredictionWithMatch[];
+  parlays: ParlayWithLegs[];
 }
 
-export function ResultsView({ results }: ResultsViewProps) {
+export function ResultsView({ results, parlays }: ResultsViewProps) {
   const [range, setRange] = useState<TimeRangeKey>("7days");
 
   const filtered = useMemo(() => {
@@ -118,6 +120,14 @@ export function ResultsView({ results }: ResultsViewProps) {
 
       {/* Lista Histórica Compacta */}
       <section className="space-y-3 px-4 pt-4">
+        {parlays.length > 0 && (
+          <div className="space-y-2.5">
+            {parlays.slice(0, 2).map((p) => (
+              <ParlayCard key={p.id} parlay={p} />
+            ))}
+          </div>
+        )}
+
         {filtered.length === 0 ? (
           <div className="rounded-2xl border border-dashed border-slate-300 bg-white px-5 py-10 text-center">
             <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-full bg-slate-100 text-slate-500">

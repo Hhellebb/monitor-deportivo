@@ -32,6 +32,7 @@ export interface PredictionWithMatch {
   pick_raw: string;
   pick_label_es: string;
   odds: number;
+  bookmaker?: string;
   consensus_pct: number | null;
   vote_breakdown: VoteBreakdownItem[] | null;
   short_reason: string | null;
@@ -40,6 +41,25 @@ export interface PredictionWithMatch {
   graded_at: string | null;
   created_at: string;
   matches: MatchRow | null;
+}
+
+export interface ParlayLegWithPrediction {
+  id: number;
+  leg_odds: number;
+  leg_order: number;
+  predictions: PredictionWithMatch | null;
+}
+
+export interface ParlayWithLegs {
+  id: number;
+  parlay_date: string;
+  title: string;
+  total_odds: number;
+  adjusted_odds: number | null;
+  legs_count: number;
+  result: "pending" | "won" | "lost" | "void";
+  graded_at: string | null;
+  parlay_legs: ParlayLegWithPrediction[];
 }
 
 export interface JobRunRow {

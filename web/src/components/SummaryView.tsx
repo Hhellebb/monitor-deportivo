@@ -48,9 +48,17 @@ export function SummaryView({ graded }: SummaryViewProps) {
     (g) => g.result === "won" || g.result === "lost"
   );
   const won = decided.filter((g) => g.result === "won").length;
-  const lost = decided.filter((g) => g.result === "lost").length;
   const voidCount = graded.filter((g) => g.result === "void").length;
   const globalPct = decided.length > 0 ? Math.round((won / decided.length) * 100) : null;
+
+  const thirtyDaysAgo = new Date();
+  thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+  const decided30d = decided.filter((g) => {
+    const ref = g.graded_at ?? g.matches?.start_time;
+    return ref ? new Date(ref) >= thirtyDaysAgo : true;
+  });
+  const won30d = decided30d.filter((g) => g.result === "won").length;
+  const lost30d = decided30d.filter((g) => g.result === "lost").length;
 
   const byLeague = buildBuckets(decided, (p) => p.matches?.league ?? "General");
   const bestLeague = byLeague[0] ?? null;
@@ -100,18 +108,18 @@ export function SummaryView({ graded }: SummaryViewProps) {
           </div>
 
           <div className="grid grid-cols-2 gap-3">
-            {/* KPI 2: Balance de Resultados */}
+            {/* KPI 2: Balance de Resultados últimos 30 días */}
             <div className="rounded-2xl border border-slate-200/90 bg-white p-4 shadow-xs">
               <div className="flex items-center justify-between">
                 <span className="text-[11px] font-bold uppercase tracking-wide text-slate-500">
-                  Balance
+                  Últimos 30 días
                 </span>
                 <CheckCircle2 className="h-4 w-4 text-[#0969DA]" />
               </div>
               <p className="mt-2 text-lg font-extrabold text-slate-900">
-                <span className="text-[#059669]">{won}</span>
+                <span className="text-[#059669]">{won30d}</span>
                 <span className="mx-1 text-slate-300">/</span>
-                <span className="text-[#DC2626]">{lost}</span>
+                <span className="text-[#DC2626]">{lost30d}</span>
               </p>
               <p className="mt-0.5 text-xs text-slate-500">
                 Acertados / Fallados

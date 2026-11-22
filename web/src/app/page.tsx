@@ -1,6 +1,7 @@
 import { TodayView } from "@/components/TodayView";
 import {
   getSupabasePublicClient,
+  type ParlayWithLegs,
   type PredictionWithMatch,
 } from "@/lib/supabase";
 
@@ -9,7 +10,7 @@ export const dynamic = "force-dynamic";
 export default async function HomePage() {
   const supabase = getSupabasePublicClient();
 
-  const [predsRes, runRes] = await Promise.all([
+  const [predsRes, runRes, parlayRes] = await Promise.all([
     supabase
       .from("predictions")
       .select("*, matches(*)")
@@ -23,11 +24,16 @@ export default async function HomePage() {
       .in("status", ["success", "partial"])
       .order("id", { ascending: false })
       .limit(1),
+    supabase
+      .from("parlays")
+      .select("*, parlay_legs(id, leg_odds, leg_order, predictions(*, matches(*)))")
+      .eq("result", "pending")
+      .order("parlay_date", { ascending: false })
+      .limit(1),
   ]);
 
   const rawList = (predsRes.data ?? []) as unknown as PredictionWithMatch[];
 
-  // Ordenar por confianza y luego por hora de inicio más próxima
   const predictions = rawList
     .filter((p) => p.matches !== null)
     .sort((a, b) => {
@@ -39,8 +45,14 @@ export default async function HomePage() {
 
   const lastRun = runRes.data?.[0];
   const lastUpdatedIso = lastRun?.finished_at ?? lastRun?.started_at ?? null;
+  const dailyParlay =
+    ((parlayRes.data?.[0] ?? null) as unknown as ParlayWithLegs | null);
 
   return (
-    <TodayView predictions={predictions} lastUpdatedIso={lastUpdatedIso} />
+    <TodayView
+      predictions={predictions}
+      dailyParlay={dailyParlay}
+      lastUpdatedIso={lastUpdatedIso}
+    />
   );
 }

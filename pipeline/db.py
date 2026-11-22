@@ -24,7 +24,7 @@ def get_supabase_admin_client() -> Client:
 
 
 class MonitorRepository:
-    """Operaciones de lectura/escritura sobre matches, predictions, tipsters y job_runs."""
+    """Operaciones de lectura/escritura sobre matches, predictions, parlays, tipsters y job_runs."""
 
     def __init__(self, client: Client) -> None:
         self.client = client
@@ -66,31 +66,83 @@ class MonitorRepository:
     def upsert_matches(self, rows: list[dict[str, Any]]) -> int:
         if not rows:
             return 0
-        # Deduplicar por id antes de enviar lote
         by_id = {r["id"]: r for r in rows}
         self.client.table("matches").upsert(list(by_id.values()), on_conflict="id").execute()
         return len(by_id)
 
-    def upsert_predictions(self, rows: list[dict[str, Any]]) -> int:
+    def upsert_predictions(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not rows:
-            return 0
-        self.client.table("predictions").upsert(
-            rows,
-            on_conflict="match_id,market_raw,pick_raw",
-        ).execute()
-        return len(rows)
-
-    def get_active_tipsters(self) -> list[dict[str, Any]]:
+            return []
         res = (
-            self.client.table("tipsters")
-            .select("*")
-            .eq("active", True)
+            self.client.table("predictions")
+            .upsert(rows, on_conflict="match_id,market_raw,pick_raw")
             .execute()
         )
         return list(res.data or [])
 
+    # --- parlays & parlay_legs ---
+    def upsert_daily_parlay(
+        self,
+        parlay_row: dict[str, Any],
+        legs: list[dict[str, Any]],
+    ) -> int:
+        res = (
+            self.client.table("parlays")
+            .upsert(parlay_row, on_conflict="parlay_date")
+            .execute()
+        )
+        parlay_id = int(res.data[0]["id"])
+
+        # Reemplazar patas del parlay del día de forma idempotente
+        self.client.table("parlay_legs").delete().eq("parlay_id", parlay_id).execute()
+        leg_rows = [
+            {
+                "parlay_id": parlay_id,
+                "prediction_id": int(leg["prediction_id"]),
+                "leg_odds": round(float(leg["leg_odds"]), 2),
+                "leg_order": idx,
+            }
+            for idx, leg in enumerate(legs, start=1)
+        ]
+        if leg_rows:
+            self.client.table("parlay_legs").insert(leg_rows).execute()
+        return parlay_id
+
+    def get_pending_parlays_with_legs(self) -> list[dict[str, Any]]:
+        res = (
+            self.client.table("parlays")
+            .select("*, parlay_legs(id, leg_odds, leg_order, predictions(id, result))")
+            .eq("result", "pending")
+            .execute()
+        )
+        return list(res.data or [])
+
+    def update_parlay_result(
+        self,
+        parlay_id: int,
+        *,
+        result: str,
+        adjusted_odds: float | None,
+    ) -> None:
+        (
+            self.client.table("parlays")
+            .update(
+                {
+                    "result": result,
+                    "adjusted_odds": adjusted_odds,
+                    "graded_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                }
+            )
+            .eq("id", parlay_id)
+            .execute()
+        )
+
+    # --- tipsters & grading ---
+    def get_active_tipsters(self) -> list[dict[str, Any]]:
+        res = self.client.table("tipsters").select("*").eq("active", True).execute()
+        return list(res.data or [])
+
     def get_pending_matches_for_grading(self, min_hours_after_kickoff: float = 2.0) -> list[dict[str, Any]]:
-        """Obtiene partidos pendientes cuya hora de inicio ya pasó hace al menos N horas."""
         cutoff = (datetime.now(UTC) - timedelta(hours=min_hours_after_kickoff)).strftime(
             "%Y-%m-%dT%H:%M:%SZ"
         )

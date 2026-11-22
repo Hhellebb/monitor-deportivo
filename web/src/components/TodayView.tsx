@@ -3,17 +3,23 @@
 import { useMemo, useState } from "react";
 import { RefreshCw, Trophy } from "lucide-react";
 import { useRouter } from "next/navigation";
-import type { PredictionWithMatch } from "@/lib/supabase";
+import type { ParlayWithLegs, PredictionWithMatch } from "@/lib/supabase";
 import { SPORT_FILTERS, type SportFilterKey } from "@/lib/formatters";
 import { LocalTime } from "@/components/LocalTime";
+import { ParlayCard } from "@/components/ParlayCard";
 import { PredictionCard } from "@/components/PredictionCard";
 
 interface TodayViewProps {
   predictions: PredictionWithMatch[];
+  dailyParlay: ParlayWithLegs | null;
   lastUpdatedIso: string | null;
 }
 
-export function TodayView({ predictions, lastUpdatedIso }: TodayViewProps) {
+export function TodayView({
+  predictions,
+  dailyParlay,
+  lastUpdatedIso,
+}: TodayViewProps) {
   const [selectedSport, setSelectedSport] = useState<SportFilterKey>("all");
   const [refreshing, setRefreshing] = useState(false);
   const router = useRouter();
@@ -107,6 +113,11 @@ export function TodayView({ predictions, lastUpdatedIso }: TodayViewProps) {
 
       {/* Lista vertical de tarjetas */}
       <section className="space-y-3.5 px-4 pt-4">
+        {/* Bloque destacado opcional: Combinada sugerida del día */}
+        {selectedSport === "all" && dailyParlay && (
+          <ParlayCard parlay={dailyParlay} />
+        )}
+
         {filtered.length === 0 ? (
           <div className="rounded-2xl border border-dashed border-slate-300 bg-white px-5 py-10 text-center">
             <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-full bg-slate-100 text-slate-500">

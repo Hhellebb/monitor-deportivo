@@ -1,4 +1,4 @@
-"""Flujo nocturno de calificación automática (Grading) en Supabase.
+"""Flujo nocturno de calificación automática (Grading) de picks individuales y parlays.
 
 Ejecución local (sin escribir en BD):
     python -m pipeline.grade_night --dry-run
@@ -24,6 +24,7 @@ from dotenv import load_dotenv
 
 from pipeline.db import MonitorRepository, get_supabase_admin_client
 from pipeline.grade import MatchOutcome, calculate_tipster_stats, grade_prediction
+from pipeline.parlay import grade_parlay
 from pipeline.utils import extract_event_id, normalize_match_url
 
 load_dotenv()
@@ -108,6 +109,40 @@ def _parse_outcome(record: dict[str, Any], sport: str) -> MatchOutcome:
     )
 
 
+def _grade_pending_parlays(repo: MonitorRepository, *, dry_run: bool) -> int:
+    """Evalúa todos los parlays pendientes en Supabase tras calificar picks individuales."""
+    pending_parlays = repo.get_pending_parlays_with_legs()
+    graded_count = 0
+
+    for parlay in pending_parlays:
+        legs_raw = parlay.get("parlay_legs") or []
+        leg_pairs: list[tuple[str, float]] = []
+        for leg in legs_raw:
+            pred = leg.get("predictions") or {}
+            leg_pairs.append((str(pred.get("result") or "pending"), float(leg["leg_odds"])))
+
+        verdict, adjusted_odds = grade_parlay(leg_pairs)
+        if verdict == "pending":
+            continue
+
+        logger.info(
+            "Parlay #%s (%s) => %s (cuota ajustada: %s)",
+            parlay["id"],
+            parlay["parlay_date"],
+            verdict.upper(),
+            adjusted_odds,
+        )
+        if not dry_run:
+            repo.update_parlay_result(
+                int(parlay["id"]),
+                result=verdict,
+                adjusted_odds=adjusted_odds,
+            )
+        graded_count += 1
+
+    return graded_count
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Calificación nocturna automática de Monitor Deportivo")
     parser.add_argument("--dry-run", action="store_true", help="Solo imprime resultados sin escribir en Supabase")
@@ -119,87 +154,87 @@ def main() -> int:
 
     try:
         pending_matches = repo.get_pending_matches_for_grading(min_hours_after_kickoff=args.min_hours)
-        if not pending_matches:
-            logger.info("No hay partidos pendientes listos para calificación.")
-            if run_id is not None:
-                repo.finish_job_run(run_id, status="success", matches_processed=0, predictions_saved=0)
-            return 0
-
-        by_sport: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        for m in pending_matches:
-            by_sport[str(m["sport"])].append(m)
-
-        scraped_by_id: dict[str, dict[str, Any]] = {}
-        with tempfile.TemporaryDirectory(prefix="oh_grade_") as tmp:
-            tmp_dir = Path(tmp)
-            for sport, matches in by_sport.items():
-                links = [str(m["external_url"]) for m in matches]
-                records = _fetch_historic_by_links(sport, links, tmp_dir / f"hist_{sport}.json")
-                for rec in records:
-                    eid = extract_event_id(str(rec.get("match_link") or ""))
-                    scraped_by_id[eid] = rec
-
         matches_updated = 0
         predictions_graded = 0
         touched_tipsters: set[str] = set()
 
-        for m in pending_matches:
-            match_id = str(m["id"])
-            sport = str(m["sport"])
-            rec = scraped_by_id.get(match_id)
-            if not rec:
-                logger.warning("Sin resultado aún para partido %s (%s vs %s)", match_id, m["home_team"], m["away_team"])
-                continue
+        if pending_matches:
+            by_sport: dict[str, list[dict[str, Any]]] = defaultdict(list)
+            for m in pending_matches:
+                by_sport[str(m["sport"])].append(m)
 
-            outcome = _parse_outcome(rec, sport)
-            if outcome.status == "pending":
-                logger.info("Partido %s aún sin marcador definitivo.", match_id)
-                continue
+            scraped_by_id: dict[str, dict[str, Any]] = {}
+            with tempfile.TemporaryDirectory(prefix="oh_grade_") as tmp:
+                tmp_dir = Path(tmp)
+                for sport, matches in by_sport.items():
+                    links = [str(m["external_url"]) for m in matches]
+                    records = _fetch_historic_by_links(sport, links, tmp_dir / f"hist_{sport}.json")
+                    for rec in records:
+                        eid = extract_event_id(str(rec.get("match_link") or ""))
+                        scraped_by_id[eid] = rec
 
-            logger.info(
-                "Partido %s (%s vs %s): status=%s marcador=%s-%s parciales=%s",
-                match_id,
-                m["home_team"],
-                m["away_team"],
-                outcome.status,
-                outcome.home_score,
-                outcome.away_score,
-                outcome.partial_results,
-            )
-
-            if not args.dry_run:
-                repo.update_match_outcome(
-                    match_id,
-                    status=outcome.status,
-                    home_score=outcome.home_score,
-                    away_score=outcome.away_score,
-                    partial_results=outcome.partial_results,
-                )
-            matches_updated += 1
-
-            for pred in m.get("predictions") or []:
-                if pred.get("result") != "pending":
+            for m in pending_matches:
+                match_id = str(m["id"])
+                sport = str(m["sport"])
+                rec = scraped_by_id.get(match_id)
+                if not rec:
+                    logger.warning("Sin resultado aún para partido %s (%s vs %s)", match_id, m["home_team"], m["away_team"])
                     continue
-                verdict = grade_prediction(
-                    market_raw=str(pred["market_raw"]),
-                    pick_raw=str(pred["pick_raw"]),
-                    outcome=outcome,
-                )
-                if verdict == "pending":
+
+                outcome = _parse_outcome(rec, sport)
+                if outcome.status == "pending":
+                    logger.info("Partido %s aún sin marcador definitivo.", match_id)
                     continue
 
                 logger.info(
-                    "  -> Predicción #%s (%s) => %s",
-                    pred["id"],
-                    pred["pick_label_es"],
-                    verdict.upper(),
+                    "Partido %s (%s vs %s): status=%s marcador=%s-%s parciales=%s",
+                    match_id,
+                    m["home_team"],
+                    m["away_team"],
+                    outcome.status,
+                    outcome.home_score,
+                    outcome.away_score,
+                    outcome.partial_results,
                 )
-                if not args.dry_run:
-                    repo.update_prediction_result(int(pred["id"]), verdict)
-                predictions_graded += 1
 
-                if pred.get("source_type") == "tipster":
-                    touched_tipsters.add(str(pred["source_name"]))
+                if not args.dry_run:
+                    repo.update_match_outcome(
+                        match_id,
+                        status=outcome.status,
+                        home_score=outcome.home_score,
+                        away_score=outcome.away_score,
+                        partial_results=outcome.partial_results,
+                    )
+                matches_updated += 1
+
+                for pred in m.get("predictions") or []:
+                    if pred.get("result") != "pending":
+                        continue
+                    verdict = grade_prediction(
+                        market_raw=str(pred["market_raw"]),
+                        pick_raw=str(pred["pick_raw"]),
+                        outcome=outcome,
+                    )
+                    if verdict == "pending":
+                        continue
+
+                    logger.info(
+                        "  -> Predicción #%s (%s) => %s",
+                        pred["id"],
+                        pred["pick_label_es"],
+                        verdict.upper(),
+                    )
+                    if not args.dry_run:
+                        repo.update_prediction_result(int(pred["id"]), verdict)
+                    predictions_graded += 1
+
+                    if pred.get("source_type") == "tipster":
+                        touched_tipsters.add(str(pred["source_name"]))
+
+        # Calificar parlays pendientes (ajusta momio automáticamente ante patas void)
+        parlays_graded = _grade_pending_parlays(repo, dry_run=args.dry_run)
+        if parlays_graded:
+            logger.info("Parlays calificados: %d", parlays_graded)
 
         # Recalcular win_rate de tipsters afectados
         if not args.dry_run:
@@ -215,7 +250,11 @@ def main() -> int:
                 logger.info("Tipster %s actualizado: %d/%d (%.2f%%)", username, won, tracked, win_rate)
 
             if run_id is not None:
-                status = "success" if matches_updated == len(pending_matches) else "partial"
+                status = (
+                    "success"
+                    if not pending_matches or matches_updated == len(pending_matches)
+                    else "partial"
+                )
                 repo.finish_job_run(
                     run_id,
                     status=status,

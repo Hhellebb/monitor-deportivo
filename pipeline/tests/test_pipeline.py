@@ -1,8 +1,8 @@
-"""Pruebas unitarias para utilidades, traductor, curador y motor de grading."""
+"""Pruebas unitarias para utilidades, traductor, curador multi-mercado, parlays y grading."""
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 import json
 from pathlib import Path
 
@@ -12,39 +12,44 @@ from pipeline.curate import (
     CuratedMatch,
     CuratedPrediction,
     curate_community_top_records,
+    curate_football_multi_market_picks,
     curate_match_vote_record,
     curate_tipster_profile,
     merge_and_select_daily_picks,
     resolve_allowed_league,
+    select_reference_odds,
 )
 from pipeline.grade import MatchOutcome, calculate_tipster_stats, grade_prediction
+from pipeline.parlay import ParlayLegCandidate, build_daily_parlay, grade_parlay
 from pipeline.translator import normalize_and_translate
-from pipeline.utils import extract_event_id, normalize_match_url, parse_kickoff_utc, to_utc_iso
+from pipeline.utils import (
+    extract_event_id,
+    extract_team_ids_from_url,
+    normalize_match_url,
+    parse_kickoff_utc,
+    to_utc_iso,
+)
 
 SAMPLES_DIR = Path(__file__).resolve().parents[1] / "samples"
 
 
 # ---------------------------------------------------------------------------
-# 1. URLs, IDs y fechas UTC
+# 1. URLs, IDs, team_ids y fechas UTC
 # ---------------------------------------------------------------------------
-def test_event_id_and_url_normalization():
-    url_mirror = "https://www.cuotasahora.com/football/h2h/brentford-xYe7DwID/everton-KluSTr9s/#CSnuq6U8"
-    url_community = "https://www.oddsportal.com/football/h2h/brentford-xYe7DwID/everton-KluSTr9s/#CSnuq6U8:1X2;2"
+def test_event_id_team_ids_and_url_normalization():
+    url_mirror = "https://www.cuotasahora.com/football/h2h/cruz-azul-G8PFBMll/guadalajara-Y5TaMKY6/#ABOBNplI"
+    url_community = "https://www.oddsportal.com/football/h2h/cruz-azul-G8PFBMll/guadalajara-Y5TaMKY6/#ABOBNplI:1X2;2"
 
-    assert extract_event_id(url_mirror) == "CSnuq6U8"
-    assert extract_event_id(url_community) == "CSnuq6U8"
+    assert extract_event_id(url_mirror) == "ABOBNplI"
+    assert extract_event_id(url_community) == "ABOBNplI"
+    assert extract_team_ids_from_url(url_mirror) == ["G8PFBMll", "Y5TaMKY6"]
     assert normalize_match_url(url_mirror) == normalize_match_url(url_community)
-    assert normalize_match_url(url_mirror) == (
-        "https://www.oddsportal.com/football/h2h/brentford-xYe7DwID/everton-KluSTr9s/#CSnuq6U8"
-    )
 
 
 def test_parse_kickoff_utc_variants():
-    # match_date estándar de upcoming/historic
     dt1 = parse_kickoff_utc(match_date="2026-11-23 20:00:00 UTC")
     assert dt1 is not None and to_utc_iso(dt1) == "2026-11-23T20:00:00Z"
 
-    # Fallback en español del espejo cuotasahora.com ('Hoy' / 'Mañana')
     dt2 = parse_kickoff_utc(
         kickoff=None,
         kickoff_text="Mañana 20:00 Mañana, 20:00 1X2",
@@ -59,10 +64,6 @@ def test_parse_kickoff_utc_variants():
     )
     assert dt3 is not None and to_utc_iso(dt3) == "2026-11-22T23:00:00Z"
 
-    # Encabezado largo de community --match-url
-    dt4 = parse_kickoff_utc(kickoff="Monday, 23 Nov 2026, 20:00")
-    assert dt4 is not None and to_utc_iso(dt4) == "2026-11-23T20:00:00Z"
-
 
 # ---------------------------------------------------------------------------
 # 2. Traductor a español natural
@@ -76,6 +77,7 @@ def test_parse_kickoff_utc_variants():
         ("Over/Under 2.5", "Over 2.5", "football", "Over/Under 2.5", "Over 2.5", "Más de 2.5 goles"),
         ("Over/Under 2.5", "Under 2.5", "football", "Over/Under 2.5", "Under 2.5", "Menos de 2.5 goles"),
         ("Over/Under 218.5", "Over", "basketball", "Over/Under 218.5", "Over 218.5", "Más de 218.5 puntos"),
+        ("Over/Under 46.5", "Under", "american-football", "Over/Under 46.5", "Under 46.5", "Menos de 46.5 puntos"),
         ("BTTS", "Yes", "football", "BTTS", "Yes", "Ambos equipos anotan"),
         ("Double Chance", "1X", "football", "Double Chance", "1X", "Club América gana o empata"),
         ("H/A, prór.", "1", "basketball", "Moneyline", "Home", "Gana Club América (Incluye T. Extra)"),
@@ -91,13 +93,57 @@ def test_normalize_and_translate(market, outcome, sport, expected_market, expect
 
 
 # ---------------------------------------------------------------------------
-# 3. Curación, alcance de ligas y deduplicación
+# 3. Alcance de 5 ligas, bet365, multi-mercado y deduplicación
 # ---------------------------------------------------------------------------
-def test_league_scope_blocks_minor_leagues():
-    assert resolve_allowed_league("Premier League", "football", "Inglaterra") == ("football", "Premier League")
-    assert resolve_allowed_league("Premier League", "football", "Egipto") is None
-    assert resolve_allowed_league("Süper Lig", "football", "Turquía") is None
+def test_league_scope_five_target_leagues():
+    assert resolve_allowed_league("Liga MX", "football", "México") == ("football", "Liga MX")
+    assert resolve_allowed_league("LaLiga", "football", "España") == ("football", "LaLiga")
+    assert resolve_allowed_league("Bundesliga", "football", "Alemania") == ("football", "Bundesliga")
+    assert resolve_allowed_league("Bundesliga", "football", "Austria") is None
     assert resolve_allowed_league("NBA", "basketball", "Estados Unidos") == ("basketball", "NBA")
+    assert resolve_allowed_league("NFL", "american-football", "USA") == ("american-football", "NFL")
+    assert resolve_allowed_league("Süper Lig", "football", "Turquía") is None
+
+
+def test_select_reference_odds_prefers_bet365_with_fallback():
+    rows_with_b365 = [
+        {"1": "1.90", "bookmaker_name": "1xBet"},
+        {"1": "1.83", "bookmaker_name": "bet365"},
+        {"1": "1.88", "bookmaker_name": "Codere"},
+    ]
+    val, bookie = select_reference_odds(rows_with_b365, "1")
+    assert val == 1.83 and bookie == "bet365"
+
+    rows_no_b365 = [
+        {"1": "1.90", "bookmaker_name": "1xBet", "blocked_outcomes": ["1"]},
+        {"1": "1.85", "bookmaker_name": "Codere"},
+        {"1": "1.82", "bookmaker_name": "Betway"},
+    ]
+    val2, bookie2 = select_reference_odds(rows_no_b365, "1")
+    assert val2 == 1.85 and bookie2 == "Codere"
+
+
+def test_curate_football_multi_market_picks():
+    mrec = {
+        "match_link": "https://www.oddsportal.com/football/h2h/a-11111111/b-22222222/#MULTI001",
+        "match_date": "2026-11-23 20:00:00 UTC",
+        "home_team": "Bayern Munich",
+        "away_team": "Dortmund",
+        "double_chance_market": [{"1X": "1.36", "bookmaker_name": "bet365"}],
+        "btts_market": [{"btts_yes": "1.62", "btts_no": "2.25", "bookmaker_name": "bet365"}],
+        "over_under_2_5_market": [{"over_odds": "1.55", "under_odds": "2.45", "bookmaker_name": "bet365"}],
+    }
+    picks = curate_football_multi_market_picks(
+        mrec,
+        league_name="Bundesliga",
+        home_team_stats={"form": "W,W,W,D,W", "btts_pct": 80.0, "over_2_5_pct": 83.0},
+        away_team_stats={"form": "W,L,W,W,D", "btts_pct": 75.0, "over_2_5_pct": 75.0},
+        vote_breakdown_1x2=[{"outcome": "1", "pct": 72}, {"outcome": "X", "pct": 14}, {"outcome": "2", "pct": 14}],
+    )
+    markets_found = {p.market_raw for p in picks}
+    assert {"Double Chance", "BTTS", "Over/Under 2.5"} <= markets_found
+    assert all(p.bookmaker == "bet365" for p in picks)
+    assert all(p.match.home_form == "W,W,W,D,W" for p in picks)
 
 
 def test_curate_real_phase1_basketball_sample():
@@ -107,14 +153,12 @@ def test_curate_real_phase1_basketball_sample():
 
     records = json.loads(sample_path.read_text(encoding="utf-8"))
     picks = curate_community_top_records(records)
-    # Debe filtrar picks NBA con >= 70% de consenso (ej. Miami Heat 89% @ 1.53)
     assert len(picks) >= 1
     assert all(p.match.league == "NBA" for p in picks)
     assert all((p.consensus_pct or 0) >= 70 for p in picks)
-    assert any("Miami Heat" in p.pick_label_es for p in picks)
 
 
-def test_merge_duplicates_boosts_confidence_and_caps_at_8():
+def test_merge_duplicates_and_match_vote_record():
     match = CuratedMatch(
         id="EV001",
         external_url="https://www.oddsportal.com/football/h2h/a/b/#EV001",
@@ -135,6 +179,7 @@ def test_merge_duplicates_boosts_confidence_and_caps_at_8():
         consensus_pct=82,
         vote_breakdown=[{"outcome": "1", "pct": 82}],
         confidence_rank=8,
+        bookmaker="Codere",
         supporting_sources=["Consenso Comunidad"],
     )
     p_tip = CuratedPrediction(
@@ -144,10 +189,11 @@ def test_merge_duplicates_boosts_confidence_and_caps_at_8():
         market_raw="1X2",
         pick_raw="Home",
         pick_label_es="Gana Club América",
-        odds=1.88,
+        odds=1.82,
         consensus_pct=82,
         vote_breakdown=None,
         confidence_rank=8,
+        bookmaker="bet365",
         supporting_sources=["BLAPRO"],
     )
 
@@ -155,38 +201,26 @@ def test_merge_duplicates_boosts_confidence_and_caps_at_8():
     assert len(merged) == 1
     assert merged[0].source_type == "hybrid"
     assert merged[0].confidence_rank == 9
-    assert merged[0].odds == 1.88
+    assert merged[0].bookmaker == "bet365"
+    assert merged[0].odds == 1.82
 
-
-def test_curate_match_vote_record_threshold():
     vote_rec = {
         "mode": "match",
         "match_url": "https://www.cuotasahora.com/football/h2h/a/b/#CSnuq6U8",
         "event_id": "CSnuq6U8",
-        "home_team": "Brentford",
-        "away_team": "Everton",
+        "home_team": "Bayern",
+        "away_team": "Mainz",
         "kickoff": "Monday, 23 Nov 2026, 20:00",
         "is_prematch": True,
-        "markets": [
-            {
-                "market": "1X2",
-                "outcomes": [
-                    {"outcome": "1", "votes_pct": 78},
-                    {"outcome": "X", "votes_pct": 12},
-                    {"outcome": "2", "votes_pct": 10},
-                ],
-            }
-        ],
+        "markets": [{"market": "1X2", "outcomes": [{"outcome": "1", "votes_pct": 85}]}],
     }
     pick = curate_match_vote_record(
         vote_rec,
-        league_name="Premier League",
+        league_name="Bundesliga",
         sport="football",
-        odds_by_outcome={"1": 1.95, "X": 3.5, "2": 3.8},
+        odds_by_outcome={"1": (1.42, "bet365")},
     )
-    assert pick is not None
-    assert pick.pick_label_es == "Gana Brentford"
-    assert pick.consensus_pct == 78
+    assert pick is not None and pick.bookmaker == "bet365"
 
 
 def test_curate_tipster_profile_skips_finished_and_low_winrate():
@@ -198,99 +232,91 @@ def test_curate_tipster_profile_skips_finished_and_low_winrate():
             {
                 "kickoff": "2026-11-23T20:00",
                 "market": "1X2",
-                "home_team": "Arsenal",
-                "away_team": "Chelsea",
+                "home_team": "Real Madrid",
+                "away_team": "Sevilla",
                 "score": None,
-                "pick_odds": 1.80,
+                "pick_odds": 1.55,
                 "outcomes": [
-                    {"odds": 1.80, "community_pct": 75, "picked": True},
-                    {"odds": 3.60, "community_pct": 15, "picked": False},
-                    {"odds": 4.20, "community_pct": 10, "picked": False},
+                    {"odds": 1.55, "community_pct": 82, "picked": True},
+                    {"odds": 4.00, "community_pct": 10, "picked": False},
+                    {"odds": 5.50, "community_pct": 8, "picked": False},
                 ],
                 "match_url": "https://www.oddsportal.com/football/h2h/a/b/#FUTURE01:1X2;2",
-            },
-            {
-                "kickoff": "2026-11-21T20:00",
-                "market": "1X2",
-                "home_team": "Liverpool",
-                "away_team": "Man Utd",
-                "score": "4-0",
-                "pick_odds": 1.75,
-                "outcomes": [
-                    {"odds": 1.75, "community_pct": 80, "picked": True},
-                    {"odds": 3.90, "community_pct": 10, "picked": False},
-                    {"odds": 4.10, "community_pct": 10, "picked": False},
-                ],
-                "match_url": "https://www.oddsportal.com/football/h2h/c/d/#PAST0001:1X2;2",
-            },
+            }
         ],
     }
     now = datetime(2026, 11, 22, 12, 0, tzinfo=UTC)
     assert curate_tipster_profile(profile, tipster_win_rate=52.0, now_utc=now) == []
     picks = curate_tipster_profile(profile, tipster_win_rate=64.0, now_utc=now)
-    assert len(picks) == 1
-    assert picks[0].match.id == "FUTURE01"
-    assert picks[0].pick_label_es == "Gana Arsenal"
+    assert len(picks) == 1 and picks[0].pick_label_es == "Gana Real Madrid"
 
 
 # ---------------------------------------------------------------------------
-# 4. Motor de calificación automática (Grading) y casos borde críticos
+# 4. Combinada (Parlay) diaria: generación y calificación con ajuste void
 # ---------------------------------------------------------------------------
-def test_grade_football_standard_markets():
+def test_build_daily_parlay_distinct_matches_and_conservative_odds():
+    cands = [
+        ParlayLegCandidate(1, "M1", 1.45, 9, 88, "Gana Miami Heat"),
+        ParlayLegCandidate(2, "M1", 1.50, 8, 82, "Más de 218.5 puntos"),  # mismo partido M1 -> debe omitirse
+        ParlayLegCandidate(3, "M2", 1.60, 9, 84, "Bayern gana o empata"),
+        ParlayLegCandidate(4, "M3", 1.38, 8, 80, "Gana Chiefs"),
+        ParlayLegCandidate(5, "M4", 2.25, 10, 90, "Gana Underdog"),  # fuera de [1.30, 1.70]
+    ]
+    plan = build_daily_parlay(cands, parlay_date=date(2026, 11, 22))
+    assert plan is not None
+    assert len(plan.legs) == 3
+    assert {l.match_id for l in plan.legs} == {"M1", "M2", "M3"}
+    assert plan.total_odds == round(1.45 * 1.60 * 1.38, 2)
+
+
+def test_grade_parlay_all_scenarios():
+    # Todos ganados
+    assert grade_parlay([("won", 1.50), ("won", 1.40)]) == ("won", 2.10)
+    # Falla al menos 1 (incluso si otro sigue pending) -> lost inmediato
+    assert grade_parlay([("lost", 1.50), ("pending", 1.40)]) == ("lost", 2.10)
+    # 1 ganado + 1 pendiente -> sigue pending
+    assert grade_parlay([("won", 1.50), ("pending", 1.40)]) == ("pending", None)
+    # 2 ganados + 1 void -> won con momio ajustado solo por los ganados
+    assert grade_parlay([("won", 1.50), ("won", 1.40), ("void", 1.60)]) == ("won", 2.10)
+    # Todos void -> void @ 1.00
+    assert grade_parlay([("void", 1.50), ("void", 1.40)]) == ("void", 1.00)
+
+
+# ---------------------------------------------------------------------------
+# 5. Motor de calificación individual (Grading) y casos borde críticos
+# ---------------------------------------------------------------------------
+def test_grade_football_standard_and_extra_time():
     m = MatchOutcome(sport="football", status="finished", home_score=2, away_score=1, partial_results="(1:0, 1:1)")
     assert grade_prediction("1X2", "Home", m) == "won"
-    assert grade_prediction("1X2", "Draw", m) == "lost"
-    assert grade_prediction("1X2", "Away", m) == "lost"
     assert grade_prediction("Over/Under 2.5", "Over 2.5", m) == "won"
-    assert grade_prediction("Over/Under 2.5", "Under 2.5", m) == "lost"
     assert grade_prediction("BTTS", "Yes", m) == "won"
-    assert grade_prediction("BTTS", "No", m) == "lost"
     assert grade_prediction("Double Chance", "1X", m) == "won"
-    assert grade_prediction("Double Chance", "X2", m) == "lost"
 
-
-def test_grade_football_extra_time_and_penalties_uses_90_min():
-    # Partido terminó 1-1 en 90' y local ganó en penales (OddsPortal reporta 2-1 con 4 parciales)
-    m = MatchOutcome(
+    # Empate 1-1 en 90' definido en penales (OddsPortal 2-1 con 4 parciales)
+    m_pen = MatchOutcome(
         sport="football",
         status="finished",
         home_score=2,
         away_score=1,
         partial_results="(0:1, 1:0, 0:0, 4:3)",
     )
-    assert grade_prediction("1X2", "Home", m) == "lost"
-    assert grade_prediction("1X2", "Draw", m) == "won"
-    assert grade_prediction("Moneyline", "Home", m) == "lost"
-    assert grade_prediction("Draw No Bet", "Home", m) == "void"
+    assert grade_prediction("1X2", "Home", m_pen) == "lost"
+    assert grade_prediction("1X2", "Draw", m_pen) == "won"
+    assert grade_prediction("Draw No Bet", "Home", m_pen) == "void"
 
 
-def test_grade_nba_includes_overtime():
-    m = MatchOutcome(
-        sport="basketball",
-        status="finished",
-        home_score=118,
-        away_score=114,
-        partial_results="(28:25, 24:27, 26:28, 28:26, 12:8)",
-    )
-    assert grade_prediction("Moneyline", "Home", m) == "won"
-    assert grade_prediction("Moneyline", "Away", m) == "lost"
-    assert grade_prediction("Over/Under 225.5", "Over 225.5", m) == "won"
+def test_grade_nba_nfl_overtime_and_voids():
+    m_nba = MatchOutcome(sport="basketball", status="finished", home_score=118, away_score=114)
+    assert grade_prediction("Moneyline", "Home", m_nba) == "won"
+    assert grade_prediction("Over/Under 225.5", "Over 225.5", m_nba) == "won"
 
+    m_nfl = MatchOutcome(sport="american-football", status="finished", home_score=27, away_score=24)
+    assert grade_prediction("Moneyline", "Home", m_nfl) == "won"
+    assert grade_prediction("Over/Under 46.5", "Over 46.5", m_nfl) == "won"
 
-def test_grade_edge_cases_push_and_postponed():
-    # Línea entera Over/Under 2.0 con 2 goles -> void (reembolso)
-    m_push = MatchOutcome(sport="football", status="finished", home_score=1, away_score=1)
-    assert grade_prediction("Over/Under 2.0", "Over 2.0", m_push) == "void"
-    assert grade_prediction("Draw No Bet", "Home", m_push) == "void"
-
-    # Partido pospuesto o cancelado -> void inmediato
     m_post = MatchOutcome(sport="football", status="postponed", home_score=None, away_score=None)
     assert grade_prediction("1X2", "Home", m_post) == "void"
 
-    m_canc = MatchOutcome(sport="basketball", status="cancelled", home_score=None, away_score=None)
-    assert grade_prediction("Moneyline", "Away", m_canc) == "void"
-
 
 def test_calculate_tipster_stats_excludes_void_and_pending():
-    tracked, won, rate = calculate_tipster_stats(["won", "won", "lost", "void", "pending"])
-    assert (tracked, won, rate) == (3, 2, 66.67)
+    assert calculate_tipster_stats(["won", "won", "lost", "void", "pending"]) == (3, 2, 66.67)

@@ -3,7 +3,11 @@
 import { useState } from "react";
 import { ChevronDown, ChevronUp, ShieldCheck, Sparkles } from "lucide-react";
 import type { PredictionWithMatch } from "@/lib/supabase";
-import { formatOutcomeLabel, getSourceBadgeText } from "@/lib/formatters";
+import {
+  formatOutcomeLabel,
+  getSourceBadgeText,
+  parseFormBadges,
+} from "@/lib/formatters";
 import { LocalTime } from "@/components/LocalTime";
 
 interface PredictionCardProps {
@@ -134,28 +138,58 @@ export function PredictionCard({ prediction }: PredictionCardProps) {
             </div>
           )}
 
-          {/* Racha reciente si está disponible */}
+          {/* Racha reciente si está disponible (pills G/E/P) */}
           {(match.home_form || match.away_form) && (
             <div>
               <p className="mb-1.5 text-xs font-bold uppercase tracking-wide text-slate-500">
-                Racha reciente
+                Racha reciente (últimos juegos)
               </p>
-              <div className="space-y-1 text-xs">
+              <div className="space-y-1.5 text-xs">
                 {match.home_form && (
-                  <p>
-                    <span className="font-semibold text-slate-800">
-                      {match.home_team}:
-                    </span>{" "}
-                    {match.home_form}
-                  </p>
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="truncate font-semibold text-slate-800">
+                      {match.home_team}
+                    </span>
+                    <div className="flex shrink-0 gap-1">
+                      {parseFormBadges(match.home_form).map((b, i) => (
+                        <span
+                          key={i}
+                          className={`inline-flex h-5 w-5 items-center justify-center rounded-md text-[10px] font-extrabold ${
+                            b.tone === "win"
+                              ? "bg-[#D1FAE5] text-[#059669]"
+                              : b.tone === "draw"
+                                ? "bg-[#FEF3C7] text-[#D97706]"
+                                : "bg-[#FEE2E2] text-[#DC2626]"
+                          }`}
+                        >
+                          {b.code}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
                 )}
                 {match.away_form && (
-                  <p>
-                    <span className="font-semibold text-slate-800">
-                      {match.away_team}:
-                    </span>{" "}
-                    {match.away_form}
-                  </p>
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="truncate font-semibold text-slate-800">
+                      {match.away_team}
+                    </span>
+                    <div className="flex shrink-0 gap-1">
+                      {parseFormBadges(match.away_form).map((b, i) => (
+                        <span
+                          key={i}
+                          className={`inline-flex h-5 w-5 items-center justify-center rounded-md text-[10px] font-extrabold ${
+                            b.tone === "win"
+                              ? "bg-[#D1FAE5] text-[#059669]"
+                              : b.tone === "draw"
+                                ? "bg-[#FEF3C7] text-[#D97706]"
+                                : "bg-[#FEE2E2] text-[#DC2626]"
+                          }`}
+                        >
+                          {b.code}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
                 )}
               </div>
             </div>
@@ -176,6 +210,12 @@ export function PredictionCard({ prediction }: PredictionCardProps) {
           <div className="flex flex-wrap items-center justify-between gap-2 border-t border-slate-200/70 pt-2.5 text-xs text-slate-500">
             <span>
               Mercado: <strong className="text-slate-700">{prediction.market_raw}</strong>
+            </span>
+            <span>
+              Ref:{" "}
+              <strong className="text-slate-700">
+                {prediction.bookmaker ?? "bet365"}
+              </strong>
             </span>
             <span>
               Confianza:{" "}

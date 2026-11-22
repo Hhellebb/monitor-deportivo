@@ -2,16 +2,30 @@ export type SportFilterKey =
   | "all"
   | "football"
   | "basketball"
-  | "baseball"
   | "american-football";
 
 export const SPORT_FILTERS: { key: SportFilterKey; label: string }[] = [
   { key: "all", label: "Todos" },
   { key: "football", label: "Fútbol" },
   { key: "basketball", label: "NBA" },
-  { key: "baseball", label: "Béisbol" },
   { key: "american-football", label: "NFL" },
 ];
+
+export function parseFormBadges(
+  form: string | null | undefined
+): { code: "G" | "E" | "P"; tone: "win" | "draw" | "loss" }[] {
+  if (!form) return [];
+  return form
+    .split(/[\s,;-]+/)
+    .map((t) => t.trim().toUpperCase())
+    .filter(Boolean)
+    .slice(0, 6)
+    .map((t) => {
+      if (t === "W" || t === "G") return { code: "G" as const, tone: "win" as const };
+      if (t === "D" || t === "E") return { code: "E" as const, tone: "draw" as const };
+      return { code: "P" as const, tone: "loss" as const };
+    });
+}
 
 export function getSportLabelEs(sport: string): string {
   switch (sport.toLowerCase()) {

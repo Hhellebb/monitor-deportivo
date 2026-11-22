@@ -70,6 +70,22 @@ def normalize_match_url(match_url: str) -> str:
     return f"{CANONICAL_HOST}{path}"
 
 
+def extract_team_ids_from_url(match_url: str) -> list[str]:
+    """Extrae los IDs de equipos (8 caracteres alfanuméricos) de una URL h2h de OddsPortal.
+
+    Ejemplo: /football/h2h/cruz-azul-G8PFBMll/guadalajara-Y5TaMKY6/#ABOBNplI
+    -> ['G8PFBMll', 'Y5TaMKY6']
+    """
+    parsed = urlparse(match_url.strip())
+    segments = [s for s in parsed.path.split("/") if s]
+    ids: list[str] = []
+    for seg in segments:
+        match = re.search(r"-([A-Za-z0-9]{8})$", seg)
+        if match:
+            ids.append(match.group(1))
+    return ids
+
+
 def parse_kickoff_utc(
     kickoff: str | None = None,
     kickoff_text: str | None = None,

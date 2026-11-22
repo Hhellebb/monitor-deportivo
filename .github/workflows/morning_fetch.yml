@@ -9,7 +9,7 @@ on:
       horizon_hours:
         description: "Ventana futura de partidos en horas"
         required: false
-        default: "36"
+        default: "48"
         type: string
 
 jobs:
@@ -43,5 +43,6 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          HORIZON_HOURS: ${{ inputs.horizon_hours || '36' }}
+          AI_API_KEY: ${{ secrets.AI_API_KEY }}
+          HORIZON_HOURS: ${{ inputs.horizon_hours || '48' }}
         run: python -m pipeline.fetch_morning --horizon-hours "$HORIZON_HOURS"

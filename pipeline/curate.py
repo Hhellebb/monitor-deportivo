@@ -12,24 +12,24 @@ from pipeline.config import (
     MAX_DAILY_PICKS,
     MIN_COMMUNITY_CONSENSUS_PCT,
     MIN_TIPSTER_WIN_RATE_PCT,
+    REFERENCE_BOOKMAKER,
     TARGET_LEAGUES,
 )
 from pipeline.translator import normalize_and_translate
 from pipeline.utils import extract_event_id, normalize_match_url, parse_kickoff_utc, to_utc_iso
 
-# Alias aceptados para filtrar ligas relevantes (inglés y español)
+# Alias aceptados para las 5 ligas objetivo: NBA, NFL, Bundesliga, LaLiga y Liga MX
 _ALLOWED_LEAGUE_ALIASES: dict[str, tuple[str, str]] = {
     "liga mx": ("football", "Liga MX"),
     "mexico-liga-mx": ("football", "Liga MX"),
-    "premier league": ("football", "Premier League"),
-    "england-premier-league": ("football", "Premier League"),
     "laliga": ("football", "LaLiga"),
     "la liga": ("football", "LaLiga"),
     "laliga ea sports": ("football", "LaLiga"),
     "spain-laliga": ("football", "LaLiga"),
-    "champions league": ("football", "Champions League"),
-    "champions-league": ("football", "Champions League"),
+    "bundesliga": ("football", "Bundesliga"),
+    "germany-bundesliga": ("football", "Bundesliga"),
     "nba": ("basketball", "NBA"),
+    "nfl": ("american-football", "NFL"),
 }
 
 
@@ -43,9 +43,11 @@ class CuratedMatch:
     away_team: str
     start_time: str  # UTC ISO-8601
     status: str = "pending"
+    home_form: str | None = None
+    away_form: str | None = None
 
     def to_db_row(self) -> dict[str, Any]:
-        return {
+        row: dict[str, Any] = {
             "id": self.id,
             "external_url": self.external_url,
             "sport": self.sport,
@@ -55,6 +57,11 @@ class CuratedMatch:
             "start_time": self.start_time,
             "status": self.status,
         }
+        if self.home_form:
+            row["home_form"] = self.home_form
+        if self.away_form:
+            row["away_form"] = self.away_form
+        return row
 
 
 @dataclass
@@ -69,6 +76,7 @@ class CuratedPrediction:
     consensus_pct: int | None
     vote_breakdown: list[dict[str, Any]] | None
     confidence_rank: int
+    bookmaker: str = REFERENCE_BOOKMAKER
     short_reason: str | None = None
     supporting_sources: list[str] = field(default_factory=list)
 
@@ -81,6 +89,7 @@ class CuratedPrediction:
             "pick_raw": self.pick_raw,
             "pick_label_es": self.pick_label_es,
             "odds": round(self.odds, 2),
+            "bookmaker": self.bookmaker,
             "consensus_pct": self.consensus_pct,
             "vote_breakdown": self.vote_breakdown,
             "short_reason": self.short_reason,
@@ -94,9 +103,9 @@ def resolve_allowed_league(
     sport: str | None = None,
     country: str | None = None,
 ) -> tuple[str, str] | None:
-    """Devuelve (sport_canónico, league_name_limpio) si la liga está dentro del alcance permitido.
+    """Devuelve (sport_canónico, league_name_limpio) si la liga pertenece a las 5 ligas objetivo.
 
-    Devuelve None para ligas menores o fuera de alcance (ej. Premier League de Egipto/Ucrania).
+    Descarta ligas menores u homónimas de otros países (ej. Bundesliga de Austria).
     """
     if not league_name:
         return None
@@ -107,10 +116,9 @@ def resolve_allowed_league(
 
     canonical_sport, clean_name = _ALLOWED_LEAGUE_ALIASES[key]
 
-    # Evitar falsos positivos como 'Premier League' de otros países (ej. Egipto, Rusia, Ucrania)
-    if clean_name == "Premier League" and country:
+    if clean_name == "Bundesliga" and country:
         c_low = country.strip().lower()
-        if c_low not in ("england", "inglaterra", "uk", "united kingdom"):
+        if c_low not in ("germany", "alemania"):
             return None
 
     if clean_name == "Liga MX" and country:
@@ -139,10 +147,9 @@ def compute_confidence_rank(
     tipster_win_rate: float | None = None,
     agreement_count: int = 1,
 ) -> int:
-    """Calcula confidence_rank en escala 1..10 combinando consenso, rango de cuota ideal y confluencia."""
+    """Calcula confidence_rank en escala 1..10 combinando consenso, rango de cuota y confluencia."""
     score = 5.0
 
-    # 1. Fuerza de consenso comunitario (70% -> +1.0, 85%+ -> +2.5, 95%+ -> +3.0)
     if consensus_pct is not None:
         if consensus_pct >= 90:
             score += 3.0
@@ -153,7 +160,6 @@ def compute_confidence_rank(
         else:
             score -= 1.0
 
-    # 2. Efectividad histórica de tipster (58% -> +1.0, 65%+ -> +2.0)
     if tipster_win_rate is not None:
         if tipster_win_rate >= 68:
             score += 2.2
@@ -162,19 +168,53 @@ def compute_confidence_rank(
         elif tipster_win_rate >= MIN_TIPSTER_WIN_RATE_PCT:
             score += 0.8
 
-    # 3. Ventana ideal de cuota (1.40 - 2.25)
     if IDEAL_ODDS_MIN <= odds <= IDEAL_ODDS_MAX:
         score += 1.5
-    elif 1.25 <= odds < IDEAL_ODDS_MIN or IDEAL_ODDS_MAX < odds <= 2.60:
-        score += 0.3
+    elif 1.28 <= odds < IDEAL_ODDS_MIN or IDEAL_ODDS_MAX < odds <= 2.60:
+        score += 0.6
     else:
         score -= 1.0
 
-    # 4. Bonus por coincidencia múltiple (comunidad + tipsters o varios tipsters)
     if agreement_count > 1:
         score += min(2.0, (agreement_count - 1) * 1.2)
 
     return max(1, min(10, int(round(score))))
+
+
+def select_reference_odds(
+    market_rows: list[dict[str, Any]],
+    outcome_key: str,
+    preferred_bookmaker: str = REFERENCE_BOOKMAKER,
+) -> tuple[float | None, str]:
+    """Extrae la cuota de `preferred_bookmaker` (bet365) para `outcome_key`.
+
+    Si `bet365` no aparece o tiene el outcome bloqueado en ese partido/espejo,
+    hace fallback al mejor momio disponible e informa el nombre real de la casa usada.
+    """
+    pref_low = preferred_bookmaker.strip().lower()
+    fallback_val: float | None = None
+    fallback_bookie = "Referencia mercado"
+
+    for row in market_rows:
+        blocked = set(row.get("blocked_outcomes") or [])
+        if outcome_key in blocked or outcome_key not in row:
+            continue
+        try:
+            val = float(row[outcome_key])
+        except (TypeError, ValueError):
+            continue
+        if val <= 1.0:
+            continue
+
+        bname = str(row.get("bookmaker_name") or "").strip()
+        if bname.lower() == pref_low:
+            return val, bname
+
+        if fallback_val is None or val > fallback_val:
+            fallback_val = val
+            fallback_bookie = bname or "Referencia mercado"
+
+    return fallback_val, fallback_bookie
 
 
 def curate_community_top_records(
@@ -213,14 +253,12 @@ def curate_community_top_records(
         if not votes or not odds_list:
             continue
 
-        # Elegir el outcome con mayor porcentaje de votos comunitarios
         best_vote = max(votes, key=lambda v: int(v.get("pct") or 0))
         top_outcome = str(best_vote.get("outcome", "")).strip()
         top_pct = int(best_vote.get("pct") or 0)
         if top_pct < min_consensus_pct:
             continue
 
-        # Buscar la cuota correspondiente a ese outcome
         matched_odds = next(
             (float(o["odds"]) for o in odds_list if str(o.get("outcome", "")).strip() == top_outcome and o.get("odds")),
             None,
@@ -267,6 +305,7 @@ def curate_community_top_records(
                 consensus_pct=top_pct,
                 vote_breakdown=votes,
                 confidence_rank=rank,
+                bookmaker="OddsPortal (Comunidad)",
                 supporting_sources=["Consenso Comunidad"],
             )
         )
@@ -279,10 +318,10 @@ def curate_match_vote_record(
     *,
     league_name: str,
     sport: str,
-    odds_by_outcome: dict[str, float],
+    odds_by_outcome: dict[str, tuple[float, str]],
     min_consensus_pct: int = MIN_COMMUNITY_CONSENSUS_PCT,
 ) -> CuratedPrediction | None:
-    """Procesa un registro de `oddsharvester community --match-url` combinado con momios de `upcoming`."""
+    """Procesa `oddsharvester community --match-url` combinado con momios (bet365/fallback) de `upcoming`."""
     if not vote_record.get("is_prematch", True):
         return None
 
@@ -301,8 +340,11 @@ def curate_match_vote_record(
     if top_pct < min_consensus_pct:
         return None
 
-    matched_odds = odds_by_outcome.get(top_outcome)
-    if matched_odds is None or matched_odds <= 1.0:
+    odds_pair = odds_by_outcome.get(top_outcome)
+    if not odds_pair:
+        return None
+    matched_odds, bookmaker = odds_pair
+    if matched_odds <= 1.0:
         return None
 
     kickoff_dt = parse_kickoff_utc(
@@ -350,8 +392,158 @@ def curate_match_vote_record(
         consensus_pct=top_pct,
         vote_breakdown=breakdown,
         confidence_rank=rank,
+        bookmaker=bookmaker,
         supporting_sources=["Consenso Comunidad"],
     )
+
+
+def curate_football_multi_market_picks(
+    match_record: dict[str, Any],
+    *,
+    league_name: str,
+    home_team_stats: dict[str, Any] | None = None,
+    away_team_stats: dict[str, Any] | None = None,
+    vote_breakdown_1x2: list[dict[str, Any]] | None = None,
+) -> list[CuratedPrediction]:
+    """Evalúa mercados secundarios de fútbol (`Over/Under 2.5`, `BTTS`, `Double Chance`)
+    respaldados por estadísticas reales de `oddsharvester team` y cuotas de `bet365` (o fallback).
+    """
+    match_url = str(match_record.get("match_link") or "")
+    home_team = str(match_record.get("home_team") or "").strip()
+    away_team = str(match_record.get("away_team") or "").strip()
+    kickoff_dt = parse_kickoff_utc(match_date=match_record.get("match_date"))
+    if not match_url or not home_team or not away_team or kickoff_dt is None:
+        return []
+
+    match_obj = CuratedMatch(
+        id=extract_event_id(match_url),
+        external_url=normalize_match_url(match_url),
+        sport="football",
+        league=league_name,
+        home_team=home_team,
+        away_team=away_team,
+        start_time=to_utc_iso(kickoff_dt),
+        home_form=home_team_stats.get("form") if home_team_stats else None,
+        away_form=away_team_stats.get("form") if away_team_stats else None,
+    )
+
+    picks: list[CuratedPrediction] = []
+
+    # 1. Doble Oportunidad (1X o X2) si el respaldo combinado en 1X2 supera >= 82% y la cuota >= 1.30
+    dc_rows = match_record.get("double_chance_market") or []
+    if dc_rows and vote_breakdown_1x2:
+        pct_map = {str(v.get("outcome", "")).strip(): int(v.get("pct") or 0) for v in vote_breakdown_1x2}
+        home_or_draw = pct_map.get("1", 0) + pct_map.get("X", 0)
+        away_or_draw = pct_map.get("2", 0) + pct_map.get("X", 0)
+        for dc_key, combined_pct in (("1X", home_or_draw), ("X2", away_or_draw)):
+            if combined_pct < 82:
+                continue
+            odds_val, bookie = select_reference_odds(dc_rows, dc_key)
+            if odds_val and 1.30 <= odds_val <= 1.85:
+                tr = normalize_and_translate("Double Chance", dc_key, home_team, away_team, sport="football")
+                if tr:
+                    picks.append(
+                        CuratedPrediction(
+                            match=match_obj,
+                            source_type="community",
+                            source_name="Consenso Comunidad",
+                            market_raw=tr.market_raw,
+                            pick_raw=tr.pick_raw,
+                            pick_label_es=tr.pick_label_es,
+                            odds=odds_val,
+                            consensus_pct=combined_pct,
+                            vote_breakdown=vote_breakdown_1x2,
+                            confidence_rank=compute_confidence_rank(odds_val, consensus_pct=combined_pct),
+                            bookmaker=bookie,
+                            supporting_sources=["Consenso Comunidad"],
+                        )
+                    )
+
+    # 2. BTTS (Ambos Equipos Anotan) si ambos equipos promedian >= 68% de BTTS en sus últimos 6 juegos
+    btts_rows = match_record.get("btts_market") or []
+    if btts_rows and home_team_stats and away_team_stats:
+        h_btts = home_team_stats.get("btts_pct")
+        a_btts = away_team_stats.get("btts_pct")
+        if h_btts is not None and a_btts is not None:
+            avg_btts = int(round((float(h_btts) + float(a_btts)) / 2.0))
+            if avg_btts >= 70:
+                odds_val, bookie = select_reference_odds(btts_rows, "btts_yes")
+                if odds_val and 1.40 <= odds_val <= 2.25:
+                    tr = normalize_and_translate("BTTS", "Yes", home_team, away_team, sport="football")
+                    if tr:
+                        picks.append(
+                            CuratedPrediction(
+                                match=match_obj,
+                                source_type="community",
+                                source_name="Tendencia Equipos",
+                                market_raw=tr.market_raw,
+                                pick_raw=tr.pick_raw,
+                                pick_label_es=tr.pick_label_es,
+                                odds=odds_val,
+                                consensus_pct=avg_btts,
+                                vote_breakdown=None,
+                                confidence_rank=compute_confidence_rank(odds_val, consensus_pct=avg_btts),
+                                bookmaker=bookie,
+                                supporting_sources=["Tendencia Equipos"],
+                            )
+                        )
+
+    # 3. Over/Under 2.5 goles basado en tendencia real de los últimos 6 juegos de ambos clubes
+    ou_rows = match_record.get("over_under_2_5_market") or []
+    if ou_rows and home_team_stats and away_team_stats:
+        h_o25 = home_team_stats.get("over_2_5_pct")
+        a_o25 = away_team_stats.get("over_2_5_pct")
+        if h_o25 is not None and a_o25 is not None:
+            avg_o25 = int(round((float(h_o25) + float(a_o25)) / 2.0))
+            if avg_o25 >= 72:
+                odds_val, bookie = select_reference_odds(ou_rows, "over_odds")
+                if odds_val is None:
+                    odds_val, bookie = select_reference_odds(ou_rows, "Over")
+                if odds_val and 1.40 <= odds_val <= 2.25:
+                    tr = normalize_and_translate("Over/Under 2.5", "Over 2.5", home_team, away_team, sport="football")
+                    if tr:
+                        picks.append(
+                            CuratedPrediction(
+                                match=match_obj,
+                                source_type="community",
+                                source_name="Tendencia Equipos",
+                                market_raw=tr.market_raw,
+                                pick_raw=tr.pick_raw,
+                                pick_label_es=tr.pick_label_es,
+                                odds=odds_val,
+                                consensus_pct=avg_o25,
+                                vote_breakdown=None,
+                                confidence_rank=compute_confidence_rank(odds_val, consensus_pct=avg_o25),
+                                bookmaker=bookie,
+                                supporting_sources=["Tendencia Equipos"],
+                            )
+                        )
+            elif avg_o25 <= 28:
+                under_pct = 100 - avg_o25
+                odds_val, bookie = select_reference_odds(ou_rows, "under_odds")
+                if odds_val is None:
+                    odds_val, bookie = select_reference_odds(ou_rows, "Under")
+                if odds_val and 1.40 <= odds_val <= 2.25:
+                    tr = normalize_and_translate("Over/Under 2.5", "Under 2.5", home_team, away_team, sport="football")
+                    if tr:
+                        picks.append(
+                            CuratedPrediction(
+                                match=match_obj,
+                                source_type="community",
+                                source_name="Tendencia Equipos",
+                                market_raw=tr.market_raw,
+                                pick_raw=tr.pick_raw,
+                                pick_label_es=tr.pick_label_es,
+                                odds=odds_val,
+                                consensus_pct=under_pct,
+                                vote_breakdown=None,
+                                confidence_rank=compute_confidence_rank(odds_val, consensus_pct=under_pct),
+                                bookmaker=bookie,
+                                supporting_sources=["Tendencia Equipos"],
+                            )
+                        )
+
+    return picks
 
 
 def curate_tipster_profile(
@@ -375,7 +567,6 @@ def curate_tipster_profile(
     curated: list[CuratedPrediction] = []
 
     for pred in profile_record.get("predictions") or []:
-        # Ignorar picks ya concluidos (tienen score)
         if pred.get("score"):
             continue
 
@@ -448,6 +639,7 @@ def curate_tipster_profile(
                 consensus_pct=comm_pct_int,
                 vote_breakdown=None,
                 confidence_rank=rank,
+                bookmaker="OddsPortal (Tipster)",
                 supporting_sources=[username],
             )
         )
@@ -460,61 +652,71 @@ def merge_and_select_daily_picks(
     *,
     max_picks: int = MAX_DAILY_PICKS,
 ) -> list[CuratedPrediction]:
-    """Unifica pronósticos coincidentes sobre el mismo partido+mercado+selección
-    incrementando su confianza, y selecciona hasta `max_picks` mejores picks diarios.
+    """Unifica pronósticos coincidentes sobre el mismo partido+mercado (sin duplicar
+    mismo partido y mercado), refuerza su confianza y selecciona hasta `max_picks`.
     """
-    grouped: dict[tuple[str, str, str], CuratedPrediction] = {}
+    grouped: dict[tuple[str, str], CuratedPrediction] = {}
 
     for cand in candidates:
-        key = (cand.match.id, cand.market_raw, cand.pick_raw)
+        key = (cand.match.id, cand.market_raw)
         if key not in grouped:
             grouped[key] = cand
             continue
 
         existing = grouped[key]
-        merged_sources = list(dict.fromkeys(existing.supporting_sources + cand.supporting_sources))
+        # Si es el mismo pick, fusionar y aumentar confianza
+        if existing.pick_raw == cand.pick_raw:
+            merged_sources = list(dict.fromkeys(existing.supporting_sources + cand.supporting_sources))
+            types = {existing.source_type, cand.source_type}
+            if "hybrid" in types or ("community" in types and "tipster" in types):
+                new_source_type = "hybrid"
+                tipsters = [s for s in merged_sources if s != "Consenso Comunidad"]
+                new_source_name = f"Comunidad + {', '.join(tipsters)}" if tipsters else "Consenso Comunidad"
+            else:
+                new_source_type = existing.source_type
+                new_source_name = ", ".join(merged_sources)
 
-        # Determinar tipo de fuente unificado
-        types = {existing.source_type, cand.source_type}
-        if "hybrid" in types or ("community" in types and "tipster" in types):
-            new_source_type = "hybrid"
-            tipsters = [s for s in merged_sources if s != "Consenso Comunidad"]
-            new_source_name = f"Comunidad + {', '.join(tipsters)}" if tipsters else "Consenso Comunidad"
-        else:
-            new_source_type = existing.source_type
-            new_source_name = ", ".join(merged_sources)
+            best_consensus = max(
+                [c for c in (existing.consensus_pct, cand.consensus_pct) if c is not None],
+                default=None,
+            )
+            # Priorizar cuota de bet365 si una de las dos viene de bet365
+            if cand.bookmaker.lower() == REFERENCE_BOOKMAKER and existing.bookmaker.lower() != REFERENCE_BOOKMAKER:
+                chosen_odds, chosen_bookie = cand.odds, cand.bookmaker
+            else:
+                chosen_odds, chosen_bookie = max(existing.odds, cand.odds), existing.bookmaker
 
-        best_consensus = max(
-            [c for c in (existing.consensus_pct, cand.consensus_pct) if c is not None],
-            default=None,
-        )
-        best_odds = max(existing.odds, cand.odds)
-        best_breakdown = existing.vote_breakdown or cand.vote_breakdown
+            if existing.match.league == "Destacado Tipster" and cand.match.league != "Destacado Tipster":
+                existing.match.league = cand.match.league
+            if not existing.match.home_form and cand.match.home_form:
+                existing.match.home_form = cand.match.home_form
+            if not existing.match.away_form and cand.match.away_form:
+                existing.match.away_form = cand.match.away_form
 
-        # Preferir nombre de liga explícito sobre placeholder de tipster
-        if existing.match.league == "Destacado Tipster" and cand.match.league != "Destacado Tipster":
-            existing.match.league = cand.match.league
+            boosted_rank = min(
+                10,
+                max(existing.confidence_rank, cand.confidence_rank)
+                + (len(merged_sources) - len(existing.supporting_sources)),
+            )
+            grouped[key] = CuratedPrediction(
+                match=existing.match,
+                source_type=new_source_type,
+                source_name=new_source_name,
+                market_raw=existing.market_raw,
+                pick_raw=existing.pick_raw,
+                pick_label_es=existing.pick_label_es,
+                odds=chosen_odds,
+                consensus_pct=best_consensus,
+                vote_breakdown=existing.vote_breakdown or cand.vote_breakdown,
+                confidence_rank=boosted_rank,
+                bookmaker=chosen_bookie,
+                short_reason=existing.short_reason or cand.short_reason,
+                supporting_sources=merged_sources,
+            )
+        elif cand.confidence_rank > existing.confidence_rank:
+            # Mismo partido y mercado pero picks opuestos -> conservar el de mayor confianza
+            grouped[key] = cand
 
-        boosted_rank = min(
-            10,
-            max(existing.confidence_rank, cand.confidence_rank) + (len(merged_sources) - len(existing.supporting_sources)),
-        )
-        grouped[key] = CuratedPrediction(
-            match=existing.match,
-            source_type=new_source_type,
-            source_name=new_source_name,
-            market_raw=existing.market_raw,
-            pick_raw=existing.pick_raw,
-            pick_label_es=existing.pick_label_es,
-            odds=best_odds,
-            consensus_pct=best_consensus,
-            vote_breakdown=best_breakdown,
-            confidence_rank=boosted_rank,
-            short_reason=existing.short_reason or cand.short_reason,
-            supporting_sources=merged_sources,
-        )
-
-    # Priorizar por confidence_rank DESC, ideal odds window, consensus_pct DESC, hora de inicio ASC
     def _sort_key(p: CuratedPrediction) -> tuple[int, int, int, str]:
         in_ideal_odds = 1 if IDEAL_ODDS_MIN <= p.odds <= IDEAL_ODDS_MAX else 0
         return (
@@ -530,7 +732,6 @@ def merge_and_select_daily_picks(
 
 def _infer_sport_from_url(url: str) -> str:
     parts = [p for p in url.split("/") if p]
-    # https://www.oddsportal.com/<sport>/...
     for idx, part in enumerate(parts):
         if "oddsportal" in part or "cuotasahora" in part:
             if idx + 1 < len(parts):
