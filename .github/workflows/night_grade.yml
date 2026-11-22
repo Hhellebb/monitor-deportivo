@@ -1,0 +1,46 @@
+name: Night Grade (Monitor Deportivo)
+
+on:
+  schedule:
+    # 06:30 UTC = 11:30 PM America/Mazatlan (UTC-7)
+    - cron: "30 6 * * *"
+    # 12:30 UTC = 05:30 AM America/Mazatlan (cierre de partidos tardíos de costa oeste / NBA)
+    - cron: "30 12 * * *"
+  workflow_dispatch:
+    inputs:
+      min_hours:
+        description: "Horas mínimas desde el inicio del partido para calificar"
+        required: false
+        default: "2.0"
+        type: string
+
+jobs:
+  grade_night:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: pipeline/requirements.txt
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r pipeline/requirements.txt
+
+      - name: Install Playwright Chromium
+        run: playwright install --with-deps chromium
+
+      - name: Run night grading
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          MIN_HOURS: ${{ inputs.min_hours || '2.0' }}
+        run: python -m pipeline.grade_night --min-hours "$MIN_HOURS"
