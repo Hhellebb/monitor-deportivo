@@ -167,6 +167,7 @@ def collect_and_curate(
 
         # 1. Top picks comunitarios por deporte activo
         sports = list(dict.fromkeys(lg.sport for lg in TARGET_LEAGUES))
+        community_football_picks: list[CuratedPrediction] = []
         for sport in sports:
             out = tmp_dir / f"community_{sport}.json"
             records = _run_oddsharvester(["community", "-s", sport], out)
@@ -175,6 +176,63 @@ def collect_and_curate(
                 dt = parse_kickoff_utc(kickoff=p.match.start_time)
                 if dt and now_utc <= dt <= max_start_utc:
                     candidates.append(p)
+                    if sport == "football":
+                        community_football_picks.append(p)
+
+        # 1b. Para partidos de fútbol ya detectados en community, raspar también sus mercados
+        # secundarios (over_under_2_5, btts, double_chance) + estadísticas de equipo + bet365
+        if community_football_picks:
+            comm_links = list(dict.fromkeys(p.match.external_url for p in community_football_picks))
+            comm_odds_args = [
+                "upcoming",
+                "-s",
+                "football",
+                "-m",
+                "1x2,over_under_2_5,btts,double_chance",
+            ]
+            for link in comm_links:
+                comm_odds_args.extend(["--match-link", link])
+            comm_match_records = _run_oddsharvester(comm_odds_args, tmp_dir / "odds_community_football.json")
+
+            comm_tids = [
+                tid
+                for mrec in comm_match_records
+                for tid in extract_team_ids_from_url(str(mrec.get("match_link") or ""))
+            ]
+            comm_team_stats = _fetch_team_stats(comm_tids, tmp_dir / "teams_community_football.json")
+            comm_by_id = {p.match.id: p for p in community_football_picks}
+
+            for mrec in comm_match_records:
+                eid = extract_event_id(str(mrec.get("match_link") or ""))
+                base_pick = comm_by_id.get(eid)
+                if not base_pick:
+                    continue
+                h_stats, a_stats = _match_team_stats_to_sides(
+                    str(mrec.get("home_team") or ""),
+                    str(mrec.get("away_team") or ""),
+                    base_pick.match.external_url,
+                    comm_team_stats,
+                )
+                if h_stats and h_stats.get("form"):
+                    base_pick.match.home_form = str(h_stats["form"])
+                if a_stats and a_stats.get("form"):
+                    base_pick.match.away_form = str(a_stats["form"])
+
+                # Actualizar cuota 1X2 del pick principal a bet365 si está disponible
+                odds_map = _extract_primary_odds_map(mrec, "football")
+                outcome_key = {"Home": "1", "Draw": "X", "Away": "2"}.get(base_pick.pick_raw)
+                if outcome_key and outcome_key in odds_map:
+                    base_pick.odds, base_pick.bookmaker = odds_map[outcome_key]
+
+                candidates.extend(
+                    curate_football_multi_market_picks(
+                        mrec,
+                        league_name=base_pick.match.league,
+                        home_team_stats=h_stats,
+                        away_team_stats=a_stats,
+                        vote_breakdown_1x2=base_pick.vote_breakdown,
+                    )
+                )
 
         # 2. Tipsters activos registrados en Supabase
         for tip in active_tipsters:
@@ -228,14 +286,16 @@ def collect_and_curate(
                 if not selected_links:
                     continue
 
-                # Mercados a raspar: multi-mercado en fútbol, ganador en NBA/NFL
+                # Mercados a raspar: multi-mercado en fútbol (sin --preview-only para obtener bet365 en O/U 2.5)
                 markets_arg = (
                     "1x2,over_under_2_5,btts,double_chance"
                     if league.sport == "football"
                     else "home_away"
                 )
                 odds_out = tmp_dir / f"odds_{league.league_slug}.json"
-                odds_args = ["upcoming", "-s", league.sport, "-m", markets_arg, "--preview-only"]
+                odds_args = ["upcoming", "-s", league.sport, "-m", markets_arg]
+                if league.sport != "football":
+                    odds_args.append("--preview-only")
                 for link in selected_links:
                     odds_args.extend(["--match-link", link])
                 match_records = _run_oddsharvester(odds_args, odds_out)

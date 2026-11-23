@@ -131,7 +131,10 @@ def test_curate_football_multi_market_picks():
         "away_team": "Dortmund",
         "double_chance_market": [{"1X": "1.36", "bookmaker_name": "bet365"}],
         "btts_market": [{"btts_yes": "1.62", "btts_no": "2.25", "bookmaker_name": "bet365"}],
-        "over_under_2_5_market": [{"over_odds": "1.55", "under_odds": "2.45", "bookmaker_name": "bet365"}],
+        "over_under_2_5_market": [
+            {"submarket_name": "Más/Menos de +1.5", "odds_over": "1.20", "odds_under": "4.50"},
+            {"submarket_name": "Más/Menos de +2.5", "odds_over": "1.55", "odds_under": "2.45", "bookmaker_name": "bet365"},
+        ],
     }
     picks = curate_football_multi_market_picks(
         mrec,

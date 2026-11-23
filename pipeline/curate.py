@@ -429,14 +429,14 @@ def curate_football_multi_market_picks(
 
     picks: list[CuratedPrediction] = []
 
-    # 1. Doble Oportunidad (1X o X2) si el respaldo combinado en 1X2 supera >= 82% y la cuota >= 1.30
+    # 1. Doble Oportunidad (1X o X2) si el respaldo combinado en 1X2 supera >= 78% y la cuota está en [1.30, 1.85]
     dc_rows = match_record.get("double_chance_market") or []
     if dc_rows and vote_breakdown_1x2:
         pct_map = {str(v.get("outcome", "")).strip(): int(v.get("pct") or 0) for v in vote_breakdown_1x2}
         home_or_draw = pct_map.get("1", 0) + pct_map.get("X", 0)
         away_or_draw = pct_map.get("2", 0) + pct_map.get("X", 0)
         for dc_key, combined_pct in (("1X", home_or_draw), ("X2", away_or_draw)):
-            if combined_pct < 82:
+            if combined_pct < 78:
                 continue
             odds_val, bookie = select_reference_odds(dc_rows, dc_key)
             if odds_val and 1.30 <= odds_val <= 1.85:
@@ -459,16 +459,16 @@ def curate_football_multi_market_picks(
                         )
                     )
 
-    # 2. BTTS (Ambos Equipos Anotan) si ambos equipos promedian >= 68% de BTTS en sus últimos 6 juegos
+    # 2. BTTS (Ambos Equipos Anotan) si ambos equipos promedian >= 65% de BTTS en sus últimos 6 juegos
     btts_rows = match_record.get("btts_market") or []
     if btts_rows and home_team_stats and away_team_stats:
         h_btts = home_team_stats.get("btts_pct")
         a_btts = away_team_stats.get("btts_pct")
         if h_btts is not None and a_btts is not None:
             avg_btts = int(round((float(h_btts) + float(a_btts)) / 2.0))
-            if avg_btts >= 70:
+            if avg_btts >= 65:
                 odds_val, bookie = select_reference_odds(btts_rows, "btts_yes")
-                if odds_val and 1.40 <= odds_val <= 2.25:
+                if odds_val and 1.35 <= odds_val <= 2.25:
                     tr = normalize_and_translate("BTTS", "Yes", home_team, away_team, sport="football")
                     if tr:
                         picks.append(
@@ -488,18 +488,17 @@ def curate_football_multi_market_picks(
                             )
                         )
 
-    # 3. Over/Under 2.5 goles basado en tendencia real de los últimos 6 juegos de ambos clubes
-    ou_rows = match_record.get("over_under_2_5_market") or []
+    # 3. Over/Under 2.5 goles (OddsHarvester usa 'odds_over' / 'odds_under' y submarket_name '+2.5')
+    ou_rows_all = match_record.get("over_under_2_5_market") or []
+    ou_rows = _filter_over_under_line(ou_rows_all, "2.5")
     if ou_rows and home_team_stats and away_team_stats:
         h_o25 = home_team_stats.get("over_2_5_pct")
         a_o25 = away_team_stats.get("over_2_5_pct")
         if h_o25 is not None and a_o25 is not None:
             avg_o25 = int(round((float(h_o25) + float(a_o25)) / 2.0))
-            if avg_o25 >= 72:
-                odds_val, bookie = select_reference_odds(ou_rows, "over_odds")
-                if odds_val is None:
-                    odds_val, bookie = select_reference_odds(ou_rows, "Over")
-                if odds_val and 1.40 <= odds_val <= 2.25:
+            if avg_o25 >= 67:
+                odds_val, bookie = select_reference_odds(ou_rows, "odds_over")
+                if odds_val and 1.35 <= odds_val <= 2.25:
                     tr = normalize_and_translate("Over/Under 2.5", "Over 2.5", home_team, away_team, sport="football")
                     if tr:
                         picks.append(
@@ -518,12 +517,10 @@ def curate_football_multi_market_picks(
                                 supporting_sources=["Tendencia Equipos"],
                             )
                         )
-            elif avg_o25 <= 28:
+            elif avg_o25 <= 33:
                 under_pct = 100 - avg_o25
-                odds_val, bookie = select_reference_odds(ou_rows, "under_odds")
-                if odds_val is None:
-                    odds_val, bookie = select_reference_odds(ou_rows, "Under")
-                if odds_val and 1.40 <= odds_val <= 2.25:
+                odds_val, bookie = select_reference_odds(ou_rows, "odds_under")
+                if odds_val and 1.35 <= odds_val <= 2.25:
                     tr = normalize_and_translate("Over/Under 2.5", "Under 2.5", home_team, away_team, sport="football")
                     if tr:
                         picks.append(
@@ -544,6 +541,21 @@ def curate_football_multi_market_picks(
                         )
 
     return picks
+
+
+def _filter_over_under_line(rows: list[dict[str, Any]], target_line: str) -> list[dict[str, Any]]:
+    """Filtra filas de Over/Under a la línea exacta (ej. '2.5') cuando OddsHarvester
+    devuelve múltiples líneas en modo passive/preview ('+0.5', '+1.5', '+2.5', ...).
+    """
+    if not rows:
+        return []
+    matched = [
+        r
+        for r in rows
+        if target_line in str(r.get("submarket_name") or "")
+        and f"{target_line}5" not in str(r.get("submarket_name") or "")
+    ]
+    return matched if matched else rows
 
 
 def curate_tipster_profile(
